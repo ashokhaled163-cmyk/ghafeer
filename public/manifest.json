@@ -1,0 +1,28 @@
+{
+  "name": "الغفير — نظام التوك توك",
+  "short_name": "الغفير",
+  "description": "أول نظام أمان وتشغيل للتوك توك في مصر",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#C9A84C",
+  "orientation": "portrait",
+  "lang": "ar",
+  "dir": "rtl",
+  "icons": [
+    {
+      "src": "/images/logo.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/images/logo.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["transportation", "utilities"],
+  "screenshots": []
+}
