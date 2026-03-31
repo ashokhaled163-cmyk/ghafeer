@@ -1,0 +1,499 @@
+import { useState, useEffect } from 'react';
+import { QRCodeSVG } from 'qrcode.react';
+import { useNavigate } from 'react-router-dom';
+import { useAuth } from '../contexts/AuthContext';
+import {
+  useClientRide, useOnlineDrivers,
+  requestRide, sendSOS,
+  reverseGeocode, calcPriceByArea, calcDistanceKm,
+  getAreaByLocation, type Area,
+} from '../hooks/useFirestore';
+import {
+  doc, updateDoc, serverTimestamp, onSnapshot,
+  query, collection, where, orderBy, limit,
+} from 'firebase/firestore';
+import { db } from '../lib/firebase';
+
+export default function ClientDashboard() {
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
+  const ride = useClientRide(user?.uid || '');
+
+  // موقع العميل
+  const [myLat, setMyLat] = useState<number | null>(null);
+  const [myLng, setMyLng] = useState<number | null>(null);
+
+  const { drivers } = useOnlineDrivers(myLat ?? undefined, myLng ?? undefined, 5);
+
+  const [pickupAddress, setPickupAddress] = useState('');
+  const [dropoffAddress, setDropoffAddress] = useState('');
+  const [dropoffLat, setDropoffLat] = useState<number | null>(null);
+  const [dropoffLng, setDropoffLng] = useState<number | null>(null);
+  const [landmarksInput, setLandmarksInput] = useState('');
+  const [estimatedPrice, setEstimatedPrice] = useState<number | null>(null);
+  const [estimatedDist, setEstimatedDist] = useState<number | null>(null);
+
+  const [showForm, setShowForm] = useState(false);
+  const [showSOS, setShowSOS] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [gpsPickupLoading, setGpsPickupLoading] = useState(false);
+  const [gpsDropoffLoading, setGpsDropoffLoading] = useState(false);
+  const [rating, setRating] = useState(0);
+  const [ratingComment, setRatingComment] = useState('');
+  const [recentRides, setRecentRides] = useState<any[]>([]);
+  const [toast, setToast] = useState('');
+
+  const showToast = (msg: string) => {
+    setToast(msg);
+    setTimeout(() => setToast(''), 3000);
+  };
+
+  // جيب موقع العميل تلقائياً عند فتح الصفحة
+  useEffect(() => {
+    if (!navigator.geolocation) return;
+    navigator.geolocation.getCurrentPosition(
+      async (pos) => {
+        const { latitude, longitude } = pos.coords;
+        setMyLat(latitude);
+        setMyLng(longitude);
+        // حوّل للعنوان تلقائياً
+        const addr = await reverseGeocode(latitude, longitude);
+        setPickupAddress(addr);
+      },
+      () => {},
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+  }, []);
+
+  const [clientArea, setClientArea] = useState<Area | null>(null);
+
+  // جيب منطقة العميل وتسعيرها
+  useEffect(() => {
+    if (myLat && myLng) {
+      getAreaByLocation(myLat, myLng).then(area => setClientArea(area));
+    }
+  }, [myLat, myLng]);
+
+  // احسب السعر بناءً على منطقة العميل
+  useEffect(() => {
+    if (myLat && myLng && dropoffLat && dropoffLng) {
+      const dist = calcDistanceKm(myLat, myLng, dropoffLat, dropoffLng);
+      setEstimatedDist(Math.round(dist * 10) / 10);
+      setEstimatedPrice(calcPriceByArea(dist, clientArea));
+    } else {
+      setEstimatedPrice(null);
+      setEstimatedDist(null);
+    }
+  }, [myLat, myLng, dropoffLat, dropoffLng, clientArea]);
+
+  // Load recent rides
+  useEffect(() => {
+    if (!user?.uid) return;
+    const q = query(
+      collection(db, 'rides'),
+      where('clientId', '==', user.uid),
+      where('status', '==', 'completed'),
+      orderBy('createdAt', 'desc'),
+      limit(5)
+    );
+    return onSnapshot(q, snap => {
+      setRecentRides(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    });
+  }, [user?.uid]);
+
+  // GPS لموقع الانطلاق
+  const getPickupGPS = () => {
+    setGpsPickupLoading(true);
+    navigator.geolocation?.getCurrentPosition(
+      async (pos) => {
+        const { latitude, longitude } = pos.coords;
+        setMyLat(latitude);
+        setMyLng(longitude);
+        const addr = await reverseGeocode(latitude, longitude);
+        setPickupAddress(addr);
+        showToast('📍 تم تحديد موقعك');
+        setGpsPickupLoading(false);
+      },
+      () => { showToast('⚠️ تعذّر GPS'); setGpsPickupLoading(false); },
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+  };
+
+  // GPS لموقع الوجهة
+  const getDropoffGPS = () => {
+    setGpsDropoffLoading(true);
+    navigator.geolocation?.getCurrentPosition(
+      async (pos) => {
+        const { latitude, longitude } = pos.coords;
+        setDropoffLat(latitude);
+        setDropoffLng(longitude);
+        const addr = await reverseGeocode(latitude, longitude);
+        setDropoffAddress(addr);
+        showToast('🏁 تم تحديد الوجهة');
+        setGpsDropoffLoading(false);
+      },
+      () => { showToast('⚠️ تعذّر GPS'); setGpsDropoffLoading(false); },
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+  };
+
+  const handleRequestRide = async () => {
+    if (!pickupAddress.trim() || !dropoffAddress.trim()) {
+      showToast('⚠️ حدد موقع الانطلاق والوجهة');
+      return;
+    }
+    if (!myLat || !myLng) {
+      showToast('⚠️ فعّل GPS لتحديد موقعك');
+      return;
+    }
+    if (!dropoffLat || !dropoffLng) {
+      showToast('⚠️ حدد موقع الوجهة بالـ GPS');
+      return;
+    }
+    if (!user) return;
+
+    setLoading(true);
+    try {
+      const manualLandmarks = landmarksInput
+        .split('\n').map(l => l.trim()).filter(Boolean);
+
+      await requestRide(
+        user.uid, user.name,
+        pickupAddress, dropoffAddress,
+        myLat, myLng,
+        dropoffLat, dropoffLng,
+        clientArea,
+        manualLandmarks.length > 0 ? manualLandmarks : undefined
+      );
+      setShowForm(false);
+      setLandmarksInput('');
+    } catch (e: any) {
+      showToast('❌ ' + (e.message || 'حدث خطأ'));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSOS = async () => {
+    if (!user) return;
+    try {
+      await sendSOS(user.uid, user.name, user.phone, ride?.id, myLat ?? undefined, myLng ?? undefined);
+      showToast('🚨 تم إرسال نداء الطوارئ مع موقعك!');
+      setShowSOS(false);
+    } catch {
+      showToast('❌ فشل إرسال SOS');
+    }
+  };
+
+  const handleCancelRide = async () => {
+    if (!ride) return;
+    await updateDoc(doc(db, 'rides', ride.id), {
+      status: 'cancelled',
+      cancelledAt: serverTimestamp(),
+    });
+  };
+
+  const handleRating = async () => {
+    if (!ride || rating === 0) return;
+    await updateDoc(doc(db, 'rides', ride.id), {
+      clientRating: rating,
+      clientComment: ratingComment,
+      ratedAt: serverTimestamp(),
+      status: 'completed',
+    });
+    if (ride.driverId) {
+      await updateDoc(doc(db, 'users', ride.driverId), {
+        totalRides: (user?.totalRides || 0) + 1,
+      });
+    }
+    showToast('⭐ شكراً لتقييمك!');
+    setRating(0);
+    setRatingComment('');
+  };
+
+  const handleLogout = async () => {
+    await logout();
+    navigate('/login');
+  };
+
+  const statusLabel: Record<string, string> = {
+    searching: '🔍 جاري البحث عن سائق قريب...',
+    accepted: '🛺 السائق في الطريق إليك',
+    waiting: '⏳ السائق وصل — أرِه كود QR',
+    started: '🛺 الرحلة جارية',
+    completed: '✅ وصلت بالسلامة!',
+  };
+
+  return (
+    <div className="min-h-screen bg-white">
+      {toast && (
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-white border border-gold/30 shadow-xl rounded-2xl px-5 py-3 font-bold text-gray-800 text-sm">
+          {toast}
+        </div>
+      )}
+
+      {/* Header */}
+      <div className="bg-white border-b border-gray-100 px-4 py-3 flex items-center justify-between shadow-sm sticky top-0 z-40">
+        <div className="flex items-center gap-3">
+          <img src="/images/logo.png" className="w-10 h-10 rounded-full border-2 border-gold" />
+          <div>
+            <p className="font-bold text-gold text-sm">الغفير</p>
+            <p className="text-xs text-gray-400">مرحباً {user?.name}</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button onClick={() => setShowSOS(true)}
+            className="bg-red-500 text-white px-3 py-1.5 rounded-xl font-bold text-xs shadow-lg shadow-red-500/30">
+            🚨 SOS
+          </button>
+          <button onClick={handleLogout} className="text-gray-400 text-xs font-semibold">خروج</button>
+        </div>
+      </div>
+
+      <div className="p-4 max-w-lg mx-auto space-y-4">
+
+        {/* Stats */}
+        <div className="grid grid-cols-3 gap-3">
+          <div className="glass-card-gold p-4 text-center">
+            <div className="text-2xl font-black text-gold">{user?.totalRides || 0}</div>
+            <div className="text-xs text-gray-500">رحلة</div>
+          </div>
+          <div className="glass-card p-4 text-center">
+            <div className="text-2xl font-black text-teal">{user?.rating?.toFixed(1) || '5.0'}</div>
+            <div className="text-xs text-gray-500">تقييمك</div>
+          </div>
+          <div className="glass-card p-4 text-center">
+            <div className="text-2xl font-black text-gold">{drivers.length}</div>
+            <div className="text-xs text-gray-500">سائق قريب</div>
+          </div>
+        </div>
+
+        {/* No active ride */}
+        {!ride && (
+          <div className="space-y-4">
+            {!showForm ? (
+              <div className="glass-card-gold p-6 text-center">
+                <div className="text-6xl mb-4">🛺</div>
+                <h2 className="text-2xl font-black text-gray-800 mb-2">محتاج توصيلة؟</h2>
+                <p className="text-gray-500 mb-1 text-sm">
+                  {drivers.length > 0
+                    ? `${drivers.length} سائق متاح في نطاق 5 كم`
+                    : '⚠️ لا يوجد سائقين قريبين منك الآن'}
+                </p>
+                {myLat && (
+                  <p className="text-xs text-teal mb-4">📍 موقعك محدد</p>
+                )}
+                <button
+                  onClick={() => setShowForm(true)}
+                  disabled={drivers.length === 0}
+                  className="btn-gold w-full text-xl py-5 disabled:opacity-50 disabled:cursor-not-allowed">
+                  🚀 اطلب غفير
+                </button>
+                {drivers.length === 0 && (
+                  <p className="text-xs text-gray-400 mt-2">جرب لاحقاً أو في منطقة أخرى</p>
+                )}
+              </div>
+            ) : (
+              <div className="glass-card-gold p-5 space-y-3">
+                <h3 className="font-black text-lg text-gray-800">📍 تفاصيل الرحلة</h3>
+
+                {/* Pickup */}
+                <div>
+                  <label className="text-sm font-semibold text-gray-600 block mb-1">موقع الانطلاق</label>
+                  <div className="flex gap-2">
+                    <input value={pickupAddress} onChange={e => setPickupAddress(e.target.value)}
+                      placeholder="موقعك الحالي"
+                      className="flex-1 px-3 py-2 rounded-xl border border-gray-200 focus:border-gold outline-none text-sm bg-white" />
+                    <button onClick={getPickupGPS} disabled={gpsPickupLoading}
+                      className="bg-teal/10 text-teal px-3 py-2 rounded-xl font-bold text-sm border border-teal/20 min-w-[44px]">
+                      {gpsPickupLoading ? '⏳' : '📍'}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Dropoff */}
+                <div>
+                  <label className="text-sm font-semibold text-gray-600 block mb-1">الوجهة</label>
+                  <div className="flex gap-2">
+                    <input value={dropoffAddress} onChange={e => setDropoffAddress(e.target.value)}
+                      placeholder="وين رايح؟"
+                      className="flex-1 px-3 py-2 rounded-xl border border-gray-200 focus:border-gold outline-none text-sm bg-white" />
+                    <button onClick={getDropoffGPS} disabled={gpsDropoffLoading}
+                      className="bg-gold/10 text-gold-dark px-3 py-2 rounded-xl font-bold text-sm border border-gold/20 min-w-[44px]">
+                      {gpsDropoffLoading ? '⏳' : '🏁'}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Price estimate */}
+                {estimatedPrice !== null && (
+                  <div className="bg-white rounded-xl p-3 border border-gold/20">
+                    <div className="flex justify-between text-sm">
+                      <span className="text-gray-500">المسافة:</span>
+                      <span className="font-bold">{estimatedDist} كم</span>
+                    </div>
+                    <div className="flex justify-between text-sm mt-1">
+                      <span className="text-gray-500">السعر التقريبي:</span>
+                      <span className="font-black text-gold text-lg">{estimatedPrice} جنيه</span>
+                    </div>
+                  </div>
+                )}
+
+                {/* Optional landmarks */}
+                <div>
+                  <label className="text-sm font-semibold text-gray-600 block mb-1">
+                    معالم يدوية <span className="text-gray-400 font-normal text-xs">(اختياري — النظام يحددها تلقائياً)</span>
+                  </label>
+                  <textarea value={landmarksInput} onChange={e => setLandmarksInput(e.target.value)}
+                    placeholder={"لو عندك معالم خاصة اكتبها:\nكوبري الجسر\nميدان المدرسة"}
+                    rows={3}
+                    className="w-full px-3 py-2 rounded-xl border border-gray-200 focus:border-gold outline-none text-sm bg-white resize-none" />
+                </div>
+
+                <div className="flex gap-2">
+                  <button onClick={handleRequestRide} disabled={loading || !dropoffLat}
+                    className="flex-1 btn-gold py-3 text-lg disabled:opacity-60">
+                    {loading ? '⏳...' : `🚀 اطلب${estimatedPrice ? ` (${estimatedPrice} ج)` : ''}`}
+                  </button>
+                  <button onClick={() => { setShowForm(false); setDropoffLat(null); setDropoffLng(null); setDropoffAddress(''); setEstimatedPrice(null); }}
+                    className="bg-gray-100 text-gray-500 px-4 py-3 rounded-xl font-bold">
+                    ✕
+                  </button>
+                </div>
+
+                {!dropoffLat && dropoffAddress && (
+                  <p className="text-xs text-amber-600 text-center">⚠️ اضغط 🏁 لتحديد الوجهة على الخريطة</p>
+                )}
+              </div>
+            )}
+
+            {/* Recent Rides */}
+            {recentRides.length > 0 && (
+              <div className="glass-card p-4">
+                <h3 className="font-bold text-gray-800 mb-3">📋 آخر الرحلات</h3>
+                {recentRides.map(r => (
+                  <div key={r.id} className="flex items-center justify-between py-2 border-b border-gray-50 last:border-0">
+                    <div>
+                      <p className="text-sm font-semibold text-gray-700 truncate max-w-[180px]">{r.dropoffAddress}</p>
+                      <p className="text-xs text-gray-400">{r.driverName || '—'} · {r.distanceKm} كم</p>
+                    </div>
+                    <div className="text-left">
+                      <p className="text-sm font-bold text-gold">{r.price} ج</p>
+                      <p className="text-xs text-gray-400">{r.clientRating ? `⭐ ${r.clientRating}` : '—'}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Active Ride */}
+        {ride && ride.status !== 'completed' && (
+          <div className="space-y-4">
+            <div className="glass-card-gold p-4 text-center">
+              <p className="font-bold text-gray-800">{statusLabel[ride.status] || ride.status}</p>
+              {ride.price > 0 && (
+                <p className="text-gold font-black text-xl mt-1">{ride.price} جنيه · {ride.distanceKm} كم</p>
+              )}
+            </div>
+
+            {/* QR when waiting */}
+            {(ride.status === 'accepted' || ride.status === 'waiting') && (
+              <div className="glass-card p-5 text-center">
+                <h3 className="font-bold text-gray-800 mb-3">🎫 كود الرحلة</h3>
+                <p className="text-gray-500 text-sm mb-4">اعرضه للسائق عند وصوله</p>
+                <div className="flex justify-center">
+                  <div className="bg-white p-4 rounded-2xl shadow-inner border border-gold/20">
+                    <QRCodeSVG value={ride.qrCode} size={180} bgColor="#ffffff" fgColor="#1a1a1a" level="H"
+                      imageSettings={{ src: '/images/logo.png', x: undefined, y: undefined, height: 35, width: 35, excavate: true }} />
+                  </div>
+                </div>
+                <p className="text-2xl font-black text-gold mt-3 tracking-widest">{ride.otp}</p>
+                <p className="text-xs text-gray-400 mt-1">رمز التحقق</p>
+              </div>
+            )}
+
+            {/* Driver info */}
+            {ride.driverName && (
+              <div className="glass-card p-4 flex items-center gap-3">
+                <div className="w-12 h-12 rounded-full bg-teal/10 flex items-center justify-center text-2xl">🛺</div>
+                <div>
+                  <p className="font-bold">{ride.driverName}</p>
+                  <p className="text-xs text-gray-400">سائقك</p>
+                </div>
+              </div>
+            )}
+
+            {/* Landmarks progress (view only for client) */}
+            {ride.status === 'started' && ride.landmarks?.length > 0 && (
+              <div className="glass-card p-4">
+                <h3 className="font-bold text-gray-800 mb-3">🗺️ مسار الرحلة</h3>
+                <div className="w-full h-2 bg-gray-100 rounded-full mb-3 overflow-hidden">
+                  <div className="h-full bg-gradient-to-l from-teal to-teal-light rounded-full transition-all"
+                    style={{ width: `${(ride.landmarks.filter((l: any) => l.done).length / ride.landmarks.length) * 100}%` }} />
+                </div>
+                <div className="space-y-2">
+                  {ride.landmarks.map((l: any, i: number) => (
+                    <div key={i} className={`flex items-center gap-3 p-3 rounded-xl ${l.done ? 'landmark-done' : 'landmark-pending'}`}>
+                      <span className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold shrink-0 ${l.done ? 'bg-white/30 text-white' : 'bg-gray-100 text-gray-500'}`}>
+                        {l.done ? '✓' : i + 1}
+                      </span>
+                      <span className={`font-semibold text-sm ${l.done ? 'text-white' : 'text-gray-700'}`}>{l.name}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {ride.status === 'searching' && (
+              <button onClick={handleCancelRide}
+                className="w-full bg-red-100 text-red-600 font-bold py-3 rounded-xl">
+                ❌ إلغاء الطلب
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Rating */}
+        {ride && ride.status === 'completed' && !ride.clientRating && (
+          <div className="glass-card-gold p-6 text-center">
+            <div className="text-5xl mb-3">🎉</div>
+            <h2 className="text-xl font-bold text-gray-800 mb-1">وصلت بالسلامة!</h2>
+            <p className="text-gray-500 text-sm mb-1">قيّم رحلتك مع {ride.driverName}</p>
+            {ride.price > 0 && <p className="text-gold font-black text-lg mb-3">{ride.price} جنيه · {ride.distanceKm} كم</p>}
+            <div className="flex justify-center gap-2 mb-4">
+              {[1, 2, 3, 4, 5].map(star => (
+                <button key={star} onClick={() => setRating(star)} className="text-3xl transition-transform hover:scale-125">
+                  {star <= rating ? '⭐' : '☆'}
+                </button>
+              ))}
+            </div>
+            <textarea value={ratingComment} onChange={e => setRatingComment(e.target.value)}
+              placeholder="تعليقك (اختياري)..."
+              className="w-full px-3 py-2 rounded-xl border border-gray-200 outline-none text-sm resize-none h-20 mb-3" />
+            <button onClick={handleRating} disabled={rating === 0}
+              className="btn-gold w-full py-3 disabled:opacity-50">
+              إرسال التقييم ⭐
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* SOS Modal */}
+      {showSOS && (
+        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl p-8 max-w-sm w-full text-center shadow-2xl">
+            <div className="text-6xl mb-4">🚨</div>
+            <h2 className="text-2xl font-bold text-red-600 mb-2">نداء طوارئ SOS</h2>
+            <p className="text-gray-500 mb-6 text-sm">سيتم إرسال موقعك وبيانات الرحلة للإدارة فوراً.</p>
+            <div className="flex gap-3">
+              <button onClick={handleSOS} className="flex-1 bg-red-500 text-white font-bold py-3 rounded-xl">🚨 أرسل SOS</button>
+              <button onClick={() => setShowSOS(false)} className="flex-1 bg-gray-100 text-gray-600 font-bold py-3 rounded-xl">إلغاء</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
